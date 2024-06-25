@@ -5,14 +5,17 @@ use std::{
     process::{self, Command},
 };
 
-use cargo_target_dep::build_target_dep;
-
 const TIMER_TRIGGER_INTEGRATION_TEST: &str = "examples/spin-timer/app-example";
 
 fn main() {
+    // Don't inherit flags from our own invocation of cargo into sub-invocations
+    // since the flags are intended for the host and we're compiling for wasm.
     std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
 
-    if let Err(e) = vergen::EmitBuilder::builder()
+    // Extract environment information to be passed to plugins.
+    // Git information will be set to defaults if Spin is not
+    // built within a Git worktree.
+    vergen::EmitBuilder::builder()
         .build_date()
         .build_timestamp()
         .cargo_target_triple()
@@ -22,14 +25,11 @@ fn main() {
         .git_commit_timestamp()
         .git_sha(true)
         .emit()
-    {
-        eprintln!("Error extracting build information: {:?}", e);
-        process::exit(1);
-    }
+        .expect("failed to extract build information");
 
     let build_spin_tests = env::var("BUILD_SPIN_EXAMPLES")
         .map(|v| v == "1")
-        .unwrap_or(true);
+        .unwrap_or(false);
     println!("cargo:rerun-if-env-changed=BUILD_SPIN_EXAMPLES");
 
     if !build_spin_tests {
@@ -39,35 +39,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     if !has_wasm32_wasi_target() {
-        let current_toolchain = env::var("RUSTUP_TOOLCHAIN").unwrap_or_default();
-        let current_toolchain = current_toolchain.split_once('-').map_or_else(|| "", |(toolchain, _)| toolchain);
-
-        let default_toolchain = run(vec!["rustup", "default"], None, None);
-        let default_toolchain = std::str::from_utf8(&default_toolchain.stdout).unwrap_or("");
-        let default_toolchain = default_toolchain.split(['-', ' ']).next().unwrap_or("");
-
-        let toolchain_override = if current_toolchain != default_toolchain {
-            format!(" +{}", current_toolchain)
-        } else {
-            String::new()
-        };
-
-        eprintln!(
-            "error: the `wasm32-wasi` target is not installed
-            = help: consider downloading the target with `rustup{} target add wasm32-wasi`",
-            toolchain_override
-        );
+        println!("error: the `wasm32-wasi` target is not installed");
         process::exit(1);
     }
 
-    if let Err(e) = std::fs::create_dir_all("target/test-programs") {
-        eprintln!("Failed to create directory: {:?}", e);
-        process::exit(1);
-    }
+    std::fs::create_dir_all("target/test-programs").unwrap();
 
     build_wasm_test_program("core-wasi-test.wasm", "crates/core/tests/core-wasi-test");
     build_wasm_test_program("redis-rust.wasm", "crates/trigger-redis/tests/rust");
-
     build_wasm_test_program(
         "spin-http-benchmark.wasm",
         "crates/trigger-http/benches/spin-http-benchmark",
@@ -92,13 +71,15 @@ fn build_wasm_test_program(name: &'static str, root: &'static str) {
 }
 
 fn has_wasm32_wasi_target() -> bool {
-    let output = run(
-        vec!["rustc", "--print=target-libdir", "--target=wasm32-wasi"],
-        None,
-        None,
-    );
-    match std::str::from_utf8(&output.stdout) {
-        Ok(output) if !output.trim().is_empty() => std::path::Path::new(output.trim()).exists(),
+    let output = Command::new("rustc")
+        .args(["--print=target-libdir", "--target=wasm32-wasi"])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let path_str = String::from_utf8_lossy(&output.stdout);
+            !path_str.trim().is_empty() && Path::new(path_str.trim()).exists()
+        },
         _ => false
     }
 }
@@ -111,6 +92,8 @@ fn cargo_build(dir: &str) {
             "--target",
             "wasm32-wasi",
             "--release",
+            // Ensure that even if `CARGO_TARGET_DIR` is set
+            // that we're still building into the right dir.
             "--target-dir",
             "./target",
         ],
@@ -130,38 +113,35 @@ fn run<S: Into<String> + AsRef<std::ffi::OsStr>>(
     cmd.stdout(process::Stdio::piped());
     cmd.stderr(process::Stdio::piped());
 
-    if let Some(dir) = dir.as_ref() {
-        cmd.current_dir(dir);
-    };
-
-    if let Some(env) = env {
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-    };
-
-    cmd.args(args);
-
-    let output = cmd.output().expect("Failed to execute command");
-    if !output.status.success() {
-        let stderr = std::str::from_utf8(&output.stderr).unwrap_or("<unknown error>");
-        let stdout = std::str::from_utf8(&output.stdout).unwrap_or("<unknown error>");
-        panic!("Command failed with error: {}\nOutput: {}", stderr, stdout);
+    if let Some(ref d) = dir {
+        cmd.current_dir(d.as_ref());
     }
 
-    output
+    if let Some(ref e) = env {
+        for (key, value) in e {
+            cmd.env(key.as_ref(), value.as_ref());
+        }
+    }
+
+    cmd.args(args.iter().map(AsRef::as_ref));
+
+    let output = cmd.output();
+
+    match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => panic!(
+            "Command execution failed with output: {} and error: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(e) => panic!("Failed to execute command: {:?}", e),
+    }
 }
 
 fn get_os_process() -> String {
     if cfg!(target_os = "windows") {
-        "powershell.exe".into()
+        String::from("powershell.exe")
     } else {
-        "bash".into()
+        String::from("bash")
     }
-}
-
-fn current_dir() -> String {
-    env::current_dir()
-        .map(|d| d.display().to_string())
-        .unwrap_or_else(|_| "<CURRENT DIR>".into())
 }
